@@ -444,11 +444,6 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                 f'grad_sync_dtype={grad_sync_dtype}, '
                 f'param_sync_dtype={param_sync_dtype}))'
             )
-        if grad_sync_dtype != dtype:
-            raise RuntimeError(
-                'DistributedFusedAdam requires dtype to match grad dtype '
-                f'(dtype={dtype}, grad_sync_dtype={grad_sync_dtype})'
-            )
         self.dtype = dtype
         self.grad_sync_dtype = grad_sync_dtype
         self.param_sync_dtype = param_sync_dtype
@@ -488,13 +483,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                 f'distributed process group size = {self.distributed_size}, '
                 f'redundant process group size = {self.redundant_size})'
             )
-        try:
-            self._process_group_ranks = [
-                get_global_rank(self.process_group, local_rank)
-                for local_rank in range(self.distributed_size)
-            ]
-        except:
-            self._process_group_ranks = list(range(self.distributed_size))
+        self.process_group_root = get_global_rank(self.process_group, 0)
 
         # Use average reduction for grad sync
         self.average_grad_sync = average_grad_sync
@@ -515,14 +504,12 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                     'with store_params=True and store_param_remainders=True'
                 )
             if (self.dtype != torch.float32
-                or self.grad_sync_dtype != torch.float32
                 or self.param_sync_dtype != torch.bfloat16):
                 raise RuntimeError(
                     'DistributedFusedAdam requires '
                     'BF16 params and FP32 optimizer state '
                     'when storing parameter remainders '
                     f'(dtype={self.dtype}, '
-                    f'grad_sync_dtype={self.grad_sync_dtype}, '
                     f'param_sync_dtype={self.param_sync_dtype}))'
                 )
         self.store_params = store_params
@@ -565,7 +552,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
 
         # Scale by factor before optimizer step. Used for grad
         # clipping and gradient scaler.
-        self._grad_scale = torch.full([], 1.0, dtype=self.dtype, device=self.device)
+        self._grad_scale = torch.full([], 1.0, dtype=torch.float32, device=self.device)
         # Norm of parameter gradients. Used for gradient clipping and
         # gradient scaler.
         self._grad_norm = None
@@ -603,7 +590,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                     sync_requests.append(
                         torch.distributed.broadcast(
                             param,
-                            src=self._process_group_ranks[0],
+                            src=self.process_group_root,
                             group=process_group,
                             async_op=True,
                         )
@@ -829,7 +816,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             buffer_size = 0
         self._grad_buffer = torch.zeros(
             [buffer_size],
-            dtype=self.dtype,
+            dtype=self.grad_sync_dtype,
             device=self.device,
         )
 
@@ -1089,7 +1076,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                     param.grad.zero_()
 
         # Reset other state
-        self._grad_scale = torch.full([], 1.0, dtype=self.dtype, device=self.device)
+        self._grad_scale = torch.full([], 1.0, dtype=torch.float32, device=self.device)
         self._grad_norm = None
         self._dummy_overflow_buf = torch.zeros([1], dtype=torch.int32, device=self.device)
 
@@ -1420,37 +1407,60 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                 # Cached gradient norm has been invalidated
                 self._grad_norm = None
 
-    def _try_start_bucket_param_sync(self):
+    def _try_start_bucket_param_sync(
+            self,
+            params=None,
+    ):
         """Attempt to launch parameter synchronization
 
-        Launches parameter synchronization if there is at least one
-        unsynchronized bucket and there are no other synchronizations
-        in progress. Parameter synchronization is asynchronous.
+        Launches parameter synchronization for buckets corresponding
+        to provided parameters, if needed. If parameters are not
+        provided and no other synchronizations are in progress,
+        attempts to find a parameter that still requires
+        synchronization. Parameter synchronization is asynchronous.
+
+        Arguments:
+            params (iterable, optional): parameters to synchronize
 
         """
 
-        # Only launch param sync if there is an unsynchronized bucket
-        # and no other syncs are in progress
-        if not any(bucket.status == self.ParameterStatus.SHARDED
+        # Default behavior: only launch param sync if no other syncs
+        # are in progress
+        if params is None:
+            params = []
+            if any(bucket.status == self.ParameterStatus.SYNCING
                    for bucket in self._params_buckets.values()):
-            return
-        if any(bucket.status == self.ParameterStatus.SYNCING
-               for bucket in self._params_buckets.values()):
-            return
-
-        # Launch param sync for all buckets containing a given param
-        for bucket_id, bucket in self._params_buckets.items():
-            if bucket.status == self.ParameterStatus.SHARDED:
-                fragment = self.state['buckets'][bucket_id].fragments[-1]
-                param_group_id = fragment.param_group_id
-                param_id = fragment.param_id
-                param = self.param_groups[param_group_id]['params'][param_id]
-                self._start_bucket_param_sync([
-                    self._params_buckets[fragment.bucket_id]
-                    for fragment in self.state[param]['fragments']
-                    if fragment.bucket_id in self._params_buckets
-                ])
                 return
+            for bucket_id, bucket in self._params_buckets.items():
+                if bucket.status == self.ParameterStatus.SHARDED:
+                    fragment = self.state['buckets'][bucket_id].fragments[-1]
+                    param_group_id = fragment.param_group_id
+                    param_id = fragment.param_id
+                    param = self.param_groups[param_group_id]['params'][param_id]
+                    params.append(param)
+                    break
+
+        # Find buckets corresponding to params
+        bucket_ids = set()
+        for param in params:
+            bucket_ids.update(
+                fragment.bucket_id
+                for fragment in self.state[param]['fragments']
+            )
+        buckets = [
+            self._params_buckets[bucket_id]
+            for bucket_id in sorted(bucket_ids)
+            if bucket_id in self._params_buckets
+        ]
+        buckets = [
+            bucket
+            for bucket in buckets
+            if bucket.status == self.ParameterStatus.SHARDED
+        ]
+
+        # Launch param sync if needed
+        if buckets:
+            self._start_bucket_param_sync(buckets)
 
     def _start_bucket_param_sync(self, buckets):
         """Synchronize parameter buckets
@@ -1462,10 +1472,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         """
 
         # Complete any outstanding param syncs
-        # Note: Not needed with contiguous param buffer since there is
-        # no memory benefit from eagerly freeing param buffers.
-        if not self.contiguous_param_buffer:
-            self._finish_bucket_param_sync()
+        self._finish_bucket_param_sync()
 
         # Initialize param state and buffers
         buckets = [
@@ -1934,7 +1941,6 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                 ranks on the root rank (default: True)
 
         """
-        ### TODO Fix
         state_dict = super().state_dict()
         if not gather_on_root:
             return state_dict
@@ -2036,14 +2042,14 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                         torch.distributed.gather(
                             gathered_chunks[0],
                             gathered_chunks,
-                            dst=self._process_group_ranks[0],
+                            dst=self.process_group_root,
                             group=self.process_group,
                             **no_copy_kwarg,
                         )
                     else:
                         torch.distributed.gather(
                             chunk,
-                            dst=self._process_group_ranks[0],
+                            dst=self.process_group_root,
                             group=self.process_group,
                         )
                 stream.wait_stream(main_stream)
